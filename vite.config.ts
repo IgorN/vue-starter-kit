@@ -6,6 +6,7 @@ import laravel from 'laravel-vite-plugin';
 import { bunny } from 'laravel-vite-plugin/fonts';
 import { defineConfig } from 'vite';
 
+// Notes pages are resolved by Inertia's page glob — no new entry needed here.
 export default defineConfig({
     plugins: [
         laravel({
