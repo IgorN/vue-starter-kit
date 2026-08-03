@@ -19390,6 +19390,94 @@ const ReviewRunResponse = objectType({
     pr_id: stringType(),
     runs: arrayType(ReviewRunTarget),
     reviews: arrayType(ReviewRecord),
+    /** Set when the launch grouped its runs under a multi-run; null for legacy single/all runs. */
+    multi_run_id: stringType().nullish(),
+});
+// ===========================================================================
+// Multi-Agent Review
+// ===========================================================================
+/**
+ * Per-agent pre-run estimate for the picker and the Configure-run page.
+ * Averages come from that agent's COMPLETED runs; an agent with no history has
+ * null averages and a zero sample count, which the UI renders as "—" rather
+ * than inventing a number. `last_summary` backs the one-line blurb on the
+ * agent card (its most recent review summary).
+ */
+const AgentRunEstimate = objectType({
+    agent_id: stringType(),
+    agent_name: stringType(),
+    avg_duration_ms: numberType().nullable(),
+    avg_cost_usd: numberType().nullable(),
+    duration_sample_count: numberType().int(),
+    cost_sample_count: numberType().int(),
+    last_summary: stringType().nullish(),
+});
+/**
+ * One agent's stance at a grouped code location.
+ * `flagged` — that agent produced a finding overlapping the group's range.
+ * `did_not_flag` — that agent's run completed and produced no such finding.
+ * `no_result` — the run failed, was cancelled, or is still in flight; it is
+ * NOT evidence of agreement and is excluded from the conflict computation.
+ */
+const MultiRunVerdictCell = objectType({
+    agent_id: stringType(),
+    verdict: enumType(['flagged', 'did_not_flag', 'no_result']),
+    severity: stringType().nullish(),
+    rationale: stringType().nullish(),
+    finding_id: stringType().nullish(),
+});
+/** A group of findings at one code location, with every agent's stance. */
+const MultiRunGroup = objectType({
+    file: stringType(),
+    line: numberType().int(),
+    label: stringType(),
+    /** ≥2 distinct verdict values among agents that produced a result. */
+    conflict: booleanType(),
+    cells: arrayType(MultiRunVerdictCell),
+});
+/** One agent's lane inside a multi-run: its run, its stats, its findings. */
+const MultiRunAgent = objectType({
+    agent_id: stringType().nullable(),
+    agent_name: stringType(),
+    run_id: stringType(),
+    status: stringType(),
+    duration_ms: numberType().int().nullish(),
+    cost_usd: numberType().nullish(),
+    score: numberType().int().nullish(),
+    summary: stringType().nullish(),
+    findings: arrayType(FindingRecord),
+});
+/** Wall-clock is the MAX across lanes (they fan out); spend is the SUM. */
+const MultiRunTotals = objectType({
+    max_duration_ms: numberType().int().nullish(),
+    total_cost_usd: numberType().nullish(),
+    agent_count: numberType().int(),
+});
+/** The whole multi-run as one document — what the result page renders. */
+const MultiRunDocument = objectType({
+    id: stringType(),
+    ran_at: stringType(),
+    pr: objectType({ id: stringType(), number: numberType().int(), title: stringType() }),
+    agents: arrayType(MultiRunAgent),
+    groups: arrayType(MultiRunGroup),
+    totals: MultiRunTotals,
+});
+/** Pointer to a multi-run, enough for the client to navigate to it. */
+const LatestMultiRunRef = objectType({
+    id: stringType(),
+    pr_id: stringType(),
+    pr_number: numberType().int(),
+    pr_title: stringType(),
+    ran_at: stringType(),
+});
+/**
+ * Answer to "what is the most recent multi-run for this scope".
+ * The wrapper object is deliberate: "no multi-run yet" is a typed 2xx with
+ * `multi_run: null`, NOT a 404 — 404 stays reserved for an unresolvable or
+ * cross-workspace explicit multi-run id.
+ */
+const LatestMultiRunResponse = objectType({
+    multi_run: LatestMultiRunRef.nullable(),
 });
 /** Intent persisted for a PR (the Intent plus the pr_id it scopes). */
 const PrIntentRecord = Intent.extend({ pr_id: stringType() });
@@ -19999,9 +20087,13 @@ const IndexStatus = objectType({
     chunks_indexed: numberType().int().nullish(),
 });
 // ---- Run request (review trigger; owned by A2, contract lives here) ----
+// Resolution precedence: `agentIds` (when non-empty) → `agentId` → `all`.
+// `agentIds` is the multi-agent picker's channel; `agentId`/`all` stay for the
+// pre-existing single-agent and run-all paths, which must keep working unchanged.
 const RunRequest = objectType({
     agentId: stringType().optional(),
     all: booleanType().optional(),
+    agentIds: arrayType(stringType()).optional(),
 });
 // ---- Structured API error envelope (returned by the API; UX taxonomy is FE) ----
 const ApiErrorBody = objectType({
@@ -20162,6 +20254,7 @@ const EvalCaseFromFindingInput = objectType({
 const EvalAgentSummary = objectType({
     agent_id: stringType(),
     agent_name: stringType(),
+    agent_model: stringType(),
     dashboard: EvalDashboard,
 });
 /** One row in the workspace-wide "recent eval runs · all agents" table. */
@@ -20210,6 +20303,12 @@ const CiFile = objectType({
     path: stringType(),
     contents: stringType(),
     editable: booleanType().default(true),
+    /**
+     * Set for entries whose real payload is binary/huge (the runner bundle): the
+     * client renders this marker instead, and `contents` is the empty string —
+     * shipping 1.6 MB of ncc output through the preview response would be absurd.
+     */
+    placeholder: stringType().nullish(),
 });
 /**
  * AgentManifest — the agent contract shared by the studio and the CI runner.
@@ -20244,35 +20343,107 @@ const CiExportInput = objectType({
     post_as: enumType(['github_review', 'pr_comment', 'none']).default('github_review'),
     triggers: arrayType(stringType()).default(['opened', 'synchronize', 'reopened']),
     base: stringType().default('main'),
+    /**
+     * The user's hand-edited workflow contents from the wizard's Preview step.
+     * Absent means "generate it" — the server never silently keeps a stale copy.
+     */
+    workflow: stringType().optional(),
 });
+// Declared before `CiInstallation`, which derives a status from its runs — a
+// `const` referenced before its initializer would throw at module load.
+//
+// `blocked` is NOT a failure: the review ran, found something at or above the
+// exported `ci_fail_on` severity, and deliberately exited non-zero to stop the
+// merge. It is kept distinct from `failed` (the runner or the artifact broke)
+// because collapsing the two would report the feature working as the feature
+// breaking — and distinct from `succeeded` because the GitHub check IS red.
+const CiRunStatus = enumType([
+    'succeeded',
+    'blocked',
+    'failed',
+    'no_findings',
+    'running',
+]);
 /** A persisted CI installation (mirrors `ci_installations`). */
 const CiInstallation = objectType({
     id: stringType(),
     agent_id: stringType(),
+    workspace_id: stringType(),
     repo: stringType(),
     target_type: CiTarget,
     installed_at: stringType(),
+    /** How the runner posts its result; travels to CI as a workflow env var. */
+    post_as: enumType(['github_review', 'pr_comment', 'none']),
+    triggers: arrayType(stringType()),
+    base: stringType(),
+    /**
+     * Pinned at first install and never re-derived from the agent's name: the
+     * runner hard-fails on more than one manifest and the commit path cannot
+     * delete, so a rename would otherwise brick the installation.
+     */
+    manifest_path: stringType(),
+    workflow_path: stringType(),
+    /** Monotonic export counter, incremented on every re-export. */
+    workflow_version: numberType().int(),
+    pr_url: stringType().nullable(),
+    last_ingest_at: stringType().nullable(),
+    /** The gate policy as it was written into the committed manifest. */
+    exported_ci_fail_on: CiFailOn.nullable(),
+    /** Derived, not stored: null ⇒ no run has arrived yet. */
+    status: CiRunStatus.nullable(),
+    last_activity_at: stringType().nullable(),
+    /** True when the agent's current `ci_fail_on` differs from the exported one. */
+    policy_drift: booleanType(),
 });
 /** Response of `POST /agents/:id/export-ci`. */
 const CiExport = objectType({
     installation: CiInstallation,
     files: arrayType(CiFile),
     pr_url: stringType().nullable(),
+    repo: stringType(),
+    file_count: numberType().int(),
 });
-const CiRunStatus = enumType(['succeeded', 'failed', 'no_findings', 'running']);
 /** A CI run row (mirrors `ci_runs`) — ingested from GitHub Actions artifacts. */
 const CiRun = objectType({
     id: stringType(),
     ci_installation_id: stringType().nullable(),
+    workspace_id: stringType(),
+    /** The `agent_runs` row this ingest created (`source='ci'`), when one exists. */
+    agent_run_id: stringType().nullable(),
+    /** GitHub Actions run id — the idempotency key for re-ingesting the same run. */
+    github_run_id: stringType(),
+    repo: stringType(),
     pr_number: numberType().int().nullable(),
+    pr_title: stringType().nullish(),
     ran_at: stringType().nullable(),
     status: stringType().nullable(),
     findings_count: numberType().int().nullable(),
+    critical: numberType().int().nullish(),
+    warning: numberType().int().nullish(),
+    suggestion: numberType().int().nullish(),
     cost_usd: numberType().nullable(),
     github_url: stringType().nullable(),
     source: stringType().nullable(),
     agent: stringType().nullish(),
     duration_s: numberType().nullish(),
+});
+/** `GET /ci-runs` — the rows plus everything the filter chips need, in one trip. */
+const CiRunsResponse = objectType({
+    runs: arrayType(CiRun),
+    agents: arrayType(objectType({ id: stringType(), name: stringType() })),
+    repos: arrayType(stringType()),
+});
+/**
+ * Outcome of a Refresh. Partial success is normal — one unreadable artifact
+ * must not mask the runs that ingested fine, so failures are itemised rather
+ * than collapsed into an error.
+ */
+const CiIngestResult = objectType({
+    examined: numberType().int(),
+    ingested: numberType().int(),
+    skipped: numberType().int(),
+    already_known: numberType().int(),
+    failures: arrayType(objectType({ github_run_id: stringType(), reason: stringType() })),
 });
 /**
  * The artifact shape uploaded by the CI action (`devdigest-result.json`).
@@ -34977,6 +35148,63 @@ function authHeaders(token, accept) {
         'User-Agent': USER_AGENT,
     };
 }
+/**
+ * Invisible in rendered markdown, but present in the raw body — how a later run
+ * recognises its own output. Matching on the bot user instead would also match
+ * every OTHER Actions workflow posting to the same PR.
+ */
+const MARKER = '<!-- devdigest:review -->';
+/** Prepend the ownership marker exactly once. */
+function withMarker(body) {
+    return body.startsWith(MARKER) ? body : `${MARKER}\n${body}`;
+}
+/**
+ * Our own previously-submitted BLOCKING reviews.
+ *
+ * Only `CHANGES_REQUESTED` is collected: those are the ones that stack up as
+ * "requested changes" on every push and keep blocking the PR. `COMMENTED`
+ * reviews cannot be dismissed by the API at all, and they block nothing, so
+ * they are deliberately left alone rather than chased with GraphQL.
+ */
+async function listOwnBlockingReviews(ctx, token, fetchImpl) {
+    const url = `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/pulls/${ctx.prNumber}/reviews?per_page=100`;
+    const res = await fetchImpl(url, { headers: authHeaders(token, 'application/vnd.github+json') });
+    if (!res.ok)
+        return [];
+    const reviews = (await res.json());
+    if (!Array.isArray(reviews))
+        return [];
+    return reviews
+        .filter((r) => (r.body ?? '').includes(MARKER) && r.state === 'CHANGES_REQUESTED')
+        .map((r) => r.id);
+}
+/**
+ * Dismiss superseded reviews. Dismissing is NOT deleting: the review stays in
+ * the PR timeline, collapsed and readable, it just stops counting as a blocker.
+ * Best-effort by design — losing this cleanup must never fail a review that has
+ * already been posted successfully.
+ */
+async function dismissReviews(ctx, token, ids, fetchImpl) {
+    for (const id of ids) {
+        const url = `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/pulls/${ctx.prNumber}/reviews/${id}/dismissals`;
+        try {
+            await fetchImpl(url, {
+                method: 'PUT',
+                headers: {
+                    ...authHeaders(token, 'application/vnd.github+json'),
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    message: 'Superseded by a newer DevDigest review of the updated diff.',
+                    event: 'DISMISS',
+                }),
+            });
+        }
+        catch {
+            // Cosmetic cleanup only — swallow and move on.
+        }
+    }
+}
 /** Fetch the PR's unified diff via the GitHub API's diff media type. */
 async function fetchPrDiff(ctx, token, fetchImpl = fetch) {
     const url = `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/pulls/${ctx.prNumber}`;
@@ -34999,13 +35227,17 @@ async function postGithubReview(ctx, token, payload, fetchImpl = fetch) {
         },
         body: JSON.stringify(body),
     });
+    // Snapshot the stale reviews BEFORE posting: after the new one lands it would
+    // be in the list too, and the order matters for a second reason — posting
+    // first means the PR is never left momentarily unblocked if this run fails.
+    const stale = await listOwnBlockingReviews(ctx, token, fetchImpl).catch(() => []);
     // GitHub's Actions token (`GITHUB_TOKEN`) — which the runner always posts with
     // — is NOT permitted to APPROVE a PR (422 "GitHub Actions is not permitted to
     // approve pull requests"). Downgrade an APPROVE event to COMMENT; the body
     // still renders the "Approved ✅" summary, we just don't submit the formal
     // approval GitHub would reject.
     const event = payload.event === 'APPROVE' ? 'COMMENT' : payload.event;
-    const base = { body: payload.body, event };
+    const base = { body: withMarker(payload.body), event };
     const hasComments = !!payload.comments && payload.comments.length > 0;
     const withComments = hasComments
         ? { ...base, comments: payload.comments.map((c) => ({ path: c.path, line: c.line, body: c.body })) }
@@ -35023,17 +35255,51 @@ async function postGithubReview(ctx, token, payload, fetchImpl = fetch) {
     if (!res.ok) {
         throw new RunnerError(`GitHub API error posting review (${url}): ${res.status} ${await res.text().catch(() => '')}`);
     }
+    // The new review now carries the CURRENT state of the diff — a re-review of
+    // the whole PR, not a delta — so the earlier ones are superseded rather than
+    // merely older. Dismiss them only now that the replacement exists.
+    await dismissReviews(ctx, token, stale, fetchImpl);
 }
-/** Post a plain issue comment (no review event) — `post_as: 'pr_comment'`. */
+/**
+ * Post the result as a plain issue comment — `post_as: 'pr_comment'`.
+ *
+ * STICKY: if a previous DevDigest comment exists it is EDITED in place rather
+ * than a second one appended, so a PR pushed to ten times carries one comment
+ * showing the current state instead of ten showing its history. GitHub keeps
+ * the edit history behind the comment's "edited" menu, so nothing is destroyed.
+ */
 async function postPrComment(ctx, token, body, fetchImpl = fetch) {
-    const url = `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/issues/${ctx.prNumber}/comments`;
+    const listUrl = `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/issues/${ctx.prNumber}/comments?per_page=100`;
+    const marked = withMarker(body);
+    let existingId = null;
+    try {
+        const listRes = await fetchImpl(listUrl, {
+            headers: authHeaders(token, 'application/vnd.github+json'),
+        });
+        if (listRes.ok) {
+            const comments = (await listRes.json());
+            if (Array.isArray(comments)) {
+                // Last wins: if an earlier version of the runner left several, the
+                // newest becomes the sticky one and older ones stay as history.
+                const mine = comments.filter((c) => (c.body ?? '').includes(MARKER));
+                existingId = mine.length > 0 ? mine[mine.length - 1].id : null;
+            }
+        }
+    }
+    catch {
+        // Lookup failed — fall through and post a fresh comment. A duplicate
+        // comment is a far better outcome than losing the result entirely.
+    }
+    const url = existingId === null
+        ? `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/issues/${ctx.prNumber}/comments`
+        : `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/issues/comments/${existingId}`;
     const res = await fetchImpl(url, {
-        method: 'POST',
+        method: existingId === null ? 'POST' : 'PATCH',
         headers: {
             ...authHeaders(token, 'application/vnd.github+json'),
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({ body: marked }),
     });
     if (!res.ok) {
         throw new RunnerError(`GitHub API error posting PR comment (${url}): ${res.status} ${await res.text().catch(() => '')}`);
@@ -35170,6 +35436,8 @@ async function runCi(deps) {
             posted: { kind: deps.postAs, payload },
             blockers,
             gateTriggered: triggered,
+            findings: outcome.review.findings,
+            failOn: manifest.ci_fail_on,
         };
     }
     catch (err) {
@@ -35178,6 +35446,107 @@ async function runCi(deps) {
         const message = err instanceof Error ? err.message : String(err);
         return { exitCode: 1, artifact: null, posted: null, error: message };
     }
+}
+
+;// CONCATENATED MODULE: ./src/summary.ts
+/** GitHub renders `error` > `warning` > `notice` with decreasing prominence. */
+const ANNOTATION_LEVEL = {
+    CRITICAL: 'error',
+    WARNING: 'warning',
+    SUGGESTION: 'notice',
+};
+const SEVERITY_ICON = {
+    CRITICAL: '🔴',
+    WARNING: '🟡',
+    SUGGESTION: '🔵',
+};
+/**
+ * Workflow-command escaping. The message body escapes `%`, CR and LF; property
+ * VALUES additionally escape `:` and `,`, which otherwise terminate the property
+ * list. Skipping this is not cosmetic — a rationale containing a comma silently
+ * truncates the annotation and everything after it is parsed as garbage.
+ */
+function escapeData(value) {
+    return value.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+}
+function escapeProperty(value) {
+    return escapeData(value).replace(/:/g, '%3A').replace(/,/g, '%2C');
+}
+/**
+ * One workflow command per finding. GitHub places these inline on the diff in
+ * "Files changed" and in the run's Annotations block, so a reviewer sees the
+ * problem at the line without opening the review.
+ */
+function annotationsFor(findings) {
+    return findings.map((f) => {
+        const level = ANNOTATION_LEVEL[f.severity];
+        const props = [
+            `file=${escapeProperty(f.file)}`,
+            `line=${f.start_line}`,
+            // GitHub ignores endLine < line; findings are grounded against the diff,
+            // so this is defensive rather than expected.
+            `endLine=${Math.max(f.end_line, f.start_line)}`,
+            `title=${escapeProperty(`DevDigest: ${f.title}`)}`,
+        ].join(',');
+        const body = f.suggestion ? `${f.rationale}\n\nSuggestion: ${f.suggestion}` : f.rationale;
+        return `::${level} ${props}::${escapeData(body)}`;
+    });
+}
+/**
+ * Markdown for `$GITHUB_STEP_SUMMARY`, rendered on the run page itself. This is
+ * the only result surface that works in EVERY `post_as` mode — including
+ * `'none'`, where nothing is written to the pull request at all.
+ */
+function jobSummaryFor(input) {
+    const { agent, findings, blockers, gateTriggered, failOn } = input;
+    const lines = [];
+    lines.push(`## DevDigest — ${agent}`);
+    lines.push('');
+    if (findings.length === 0) {
+        lines.push('**No findings.** The diff was reviewed and nothing was flagged.');
+    }
+    else {
+        const counts = ['CRITICAL', 'WARNING', 'SUGGESTION']
+            .map((s) => ({ s, n: findings.filter((f) => f.severity === s).length }))
+            .filter((c) => c.n > 0)
+            .map((c) => `${SEVERITY_ICON[c.s]} ${c.n} ${c.s.toLowerCase()}`)
+            .join(' · ');
+        lines.push(`**${findings.length} findings** — ${counts}`);
+    }
+    lines.push('');
+    lines.push(gateTriggered
+        ? `> ❌ **Merge blocked.** ${blockers} finding(s) at or above \`fail_on: ${failOn}\`. ` +
+            'This step exits non-zero by design — it is the gate working, not a runner failure.'
+        : `> ✅ **Not blocking.** Gate is \`fail_on: ${failOn}\`.`);
+    if (findings.length > 0) {
+        lines.push('');
+        lines.push('| | Severity | Finding | Location |');
+        lines.push('|---|---|---|---|');
+        for (const f of findings) {
+            // Pipes inside a cell would break the table; newlines would end the row.
+            const title = f.title.replace(/\|/g, '\\|').replace(/\n/g, ' ');
+            lines.push(`| ${SEVERITY_ICON[f.severity]} | ${f.severity} | ${title} | \`${f.file}:${f.start_line}\` |`);
+        }
+    }
+    lines.push('');
+    lines.push(`PR #${input.prNumber} · ${(input.durationMs / 1000).toFixed(1)}s · ` +
+        `$${input.costUsd.toFixed(4)} · posted as \`${input.postedTo}\``);
+    lines.push('');
+    return `${lines.join('\n')}\n`;
+}
+/**
+ * The last line in the log. Replaces a key=value dump that required decoding —
+ * this states, in one sentence, what happened and why the step is about to fail.
+ */
+function finalLineFor(input) {
+    if (input.gateTriggered) {
+        return (`[agent-runner] BLOCKED: ${input.blockers} of ${input.findings} findings are at or above ` +
+            `fail_on=${input.failOn}. Exiting non-zero to stop the merge.`);
+    }
+    if (input.findings === 0)
+        return '[agent-runner] OK: no findings.';
+    return (`[agent-runner] OK: ${input.findings} finding(s), none at or above fail_on=${input.failOn}. ` +
+        'Not blocking.');
 }
 
 ;// CONCATENATED MODULE: ./src/index.ts
@@ -35200,6 +35569,7 @@ async function runCi(deps) {
  * unit-tested hermetically. This file only wires those dependencies to the
  * real world and maps the result onto `process.exitCode`.
  */
+
 
 
 
@@ -35228,13 +35598,46 @@ async function main(env = process.env) {
         readDir: external_node_fs_namespaceObject.readdirSync,
         writeFile: external_node_fs_namespaceObject.writeFileSync,
     });
+    // `artifact === null` is the discriminant — truthiness on `error` does not
+    // narrow this union (insights/INSIGHTS.md, 2026-07-08).
     if (result.artifact === null) {
         console.error(`[agent-runner] FAILED: ${result.error}`);
+        return result.exitCode;
     }
-    else {
-        console.log(`[agent-runner] findings=${result.artifact.findings_count} blockers=${result.blockers} ` +
-            `gateTriggered=${result.gateTriggered} posted=${result.posted.kind}`);
+    // Inline annotations: one per finding, placed on the diff line in
+    // "Files changed" and listed in the run's Annotations block.
+    for (const line of annotationsFor(result.findings))
+        console.log(line);
+    // The run page itself. Written only when Actions provides the file — running
+    // the bundle locally must not crash on a missing env var.
+    const summaryPath = env.GITHUB_STEP_SUMMARY;
+    if (summaryPath) {
+        const summary = jobSummaryFor({
+            agent: result.artifact.agent,
+            findings: result.findings,
+            blockers: result.blockers,
+            gateTriggered: result.gateTriggered,
+            failOn: result.failOn,
+            costUsd: result.artifact.cost_usd ?? 0,
+            durationMs: result.artifact.duration_ms ?? 0,
+            prNumber: result.artifact.pr_number ?? 0,
+            postedTo: result.posted.kind,
+        });
+        try {
+            (0,external_node_fs_namespaceObject.appendFileSync)(summaryPath, summary);
+        }
+        catch (err) {
+            // A summary is reporting, not the result. Losing it must never turn a
+            // completed review into a failed step.
+            console.error(`[agent-runner] could not write job summary: ${String(err)}`);
+        }
     }
+    console.log(finalLineFor({
+        findings: result.artifact.findings_count,
+        blockers: result.blockers,
+        gateTriggered: result.gateTriggered,
+        failOn: result.failOn,
+    }));
     return result.exitCode;
 }
 // Only run when executed directly (CI), never on import (tests import `main`
