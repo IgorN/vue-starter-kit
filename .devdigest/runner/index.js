@@ -35195,16 +35195,44 @@ async function listOwnBlockingReviews(ctx, token, fetchImpl) {
         return [];
     return reviews
         .filter((r) => isOwnBody(r.body ?? '') && r.state === 'CHANGES_REQUESTED')
-        .map((r) => r.id);
+        .map((r) => ({ id: r.id, nodeId: r.node_id }));
 }
 /**
- * Dismiss superseded reviews. Dismissing is NOT deleting: the review stays in
- * the PR timeline, collapsed and readable, it just stops counting as a blocker.
- * Best-effort by design — losing this cleanup must never fail a review that has
- * already been posted successfully.
+ * Collapse a superseded review's BODY in the conversation.
+ *
+ * Dismissing and minimising solve two different halves of the same complaint and
+ * neither replaces the other: dismissal clears the blocking state but leaves the
+ * full text sitting in the timeline, so a PR pushed to five times still reads as
+ * five walls of findings. `minimizeComment` (GraphQL only — there is no REST
+ * equivalent) folds it to "marked as outdated", which is what actually removes
+ * the noise. Reversible in the UI, and the text stays readable behind the fold.
  */
-async function dismissReviews(ctx, token, ids, fetchImpl) {
-    for (const id of ids) {
+async function minimizeReview(token, nodeId, fetchImpl) {
+    await fetchImpl(`${GITHUB_API_BASE}/graphql`, {
+        method: 'POST',
+        headers: {
+            ...authHeaders(token, 'application/vnd.github+json'),
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            query: 'mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) ' +
+                '{ minimizedComment { isMinimized } } }',
+            variables: { id: nodeId },
+        }),
+    });
+}
+/**
+ * Retire superseded reviews: dismiss (stops blocking) AND minimise (stops
+ * shouting). Dismissal alone was measured on a real PR to be insufficient — the
+ * three older reviews correctly went to `DISMISSED` and every one of them still
+ * rendered in full in the conversation, so the pile looked untouched.
+ *
+ * Neither step deletes anything: the text stays readable behind the fold and the
+ * whole thing is reversible from the UI. Best-effort by design — losing this
+ * cleanup must never fail a review that has already been posted successfully.
+ */
+async function dismissReviews(ctx, token, stale, fetchImpl) {
+    for (const { id, nodeId } of stale) {
         const url = `${GITHUB_API_BASE}/repos/${ctx.owner}/${ctx.repo}/pulls/${ctx.prNumber}/reviews/${id}/dismissals`;
         try {
             await fetchImpl(url, {
@@ -35218,6 +35246,8 @@ async function dismissReviews(ctx, token, ids, fetchImpl) {
                     event: 'DISMISS',
                 }),
             });
+            if (nodeId)
+                await minimizeReview(token, nodeId, fetchImpl);
         }
         catch {
             // Cosmetic cleanup only — swallow and move on.
