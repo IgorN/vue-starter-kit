@@ -35152,8 +35152,27 @@ function authHeaders(token, accept) {
  * Invisible in rendered markdown, but present in the raw body — how a later run
  * recognises its own output. Matching on the bot user instead would also match
  * every OTHER Actions workflow posting to the same PR.
+ *
+ * ⚠️ THIS STRING IS A COMPATIBILITY CONTRACT — do not "tidy" it. It is matched
+ * against bodies written by runner builds that are already committed inside
+ * other people's repositories and may not be re-exported for months. Changing it
+ * orphans every review posted so far: they stop being recognised as ours, stop
+ * being superseded, and pile up again exactly as they did before this existed.
+ * A new format needs a NEW marker matched ALONGSIDE this one, never instead.
  */
 const MARKER = '<!-- devdigest:review -->';
+/**
+ * Reviews posted by a runner build older than the marker carry no marker at all,
+ * so without this they would be invisible to the cleanup FOREVER — every repo
+ * that installed before the upgrade would keep its existing pile of blocking
+ * reviews. The footer comes from `reviewer-core`'s `toReviewPayload`
+ * (`output/to-review.ts`) and has been in every posted body since the beginning.
+ */
+const LEGACY_SIGNATURE = 'Posted via DevDigest';
+/** Ours — either the explicit marker, or the pre-marker footer. */
+function isOwnBody(body) {
+    return body.includes(MARKER) || body.includes(LEGACY_SIGNATURE);
+}
 /** Prepend the ownership marker exactly once. */
 function withMarker(body) {
     return body.startsWith(MARKER) ? body : `${MARKER}\n${body}`;
@@ -35175,7 +35194,7 @@ async function listOwnBlockingReviews(ctx, token, fetchImpl) {
     if (!Array.isArray(reviews))
         return [];
     return reviews
-        .filter((r) => (r.body ?? '').includes(MARKER) && r.state === 'CHANGES_REQUESTED')
+        .filter((r) => isOwnBody(r.body ?? '') && r.state === 'CHANGES_REQUESTED')
         .map((r) => r.id);
 }
 /**
@@ -35281,7 +35300,7 @@ async function postPrComment(ctx, token, body, fetchImpl = fetch) {
             if (Array.isArray(comments)) {
                 // Last wins: if an earlier version of the runner left several, the
                 // newest becomes the sticky one and older ones stay as history.
-                const mine = comments.filter((c) => (c.body ?? '').includes(MARKER));
+                const mine = comments.filter((c) => isOwnBody(c.body ?? ''));
                 existingId = mine.length > 0 ? mine[mine.length - 1].id : null;
             }
         }
